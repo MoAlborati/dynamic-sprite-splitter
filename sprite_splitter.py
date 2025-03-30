@@ -1,8 +1,9 @@
 import os
+import argparse
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 from skimage.measure import label, regionprops
-from scipy.ndimage import binary_closing
+from scipy.ndimage import binary_closing, grey_erosion
 
 def remove_white_border(image, white_threshold=220):
     data = np.array(image)
@@ -11,6 +12,28 @@ def remove_white_border(image, white_threshold=220):
     faint = a < 255
     data[near_white & faint] = [0, 0, 0, 0]
     return Image.fromarray(data)
+
+def shave_outline(image, erosion_size=1):
+    """
+    Erodes the alpha channel by 'erosion_size' pixels using grey_erosion.
+    """
+    arr = np.array(image)
+    alpha = arr[..., 3]
+    kernel_size = (2 * erosion_size + 1, 2 * erosion_size + 1)
+    alpha_ero = grey_erosion(alpha, size=kernel_size)
+    arr[..., 3] = alpha_ero
+    return Image.fromarray(arr, mode='RGBA')
+
+def smooth_alpha(image, radius=1):
+    """
+    Applies a Gaussian blur to the alpha channel then re-runs the white-border removal.
+    This helps smooth jagged edges without reintroducing the white outline.
+    """
+    r, g, b, a = image.split()
+    a_blurred = a.filter(ImageFilter.GaussianBlur(radius=radius))
+    blurred = Image.merge("RGBA", (r, g, b, a_blurred))
+    # Reapply white-border removal to clear out any new white fringe.
+    return remove_white_border(blurred)
 
 def boxes_overlap(boxA, boxB):
     ax1, ay1, ax2, ay2 = boxA
@@ -27,19 +50,11 @@ def box_area(box):
     return (x1 - x0) * (y1 - y0)
 
 def is_contained(box_small, box_big):
-    """
-    Returns True if box_small is fully inside box_big.
-    box = (x0, y0, x1, y1)
-    """
     x0s, y0s, x1s, y1s = box_small
     x0b, y0b, x1b, y1b = box_big
     return (x0b <= x0s) and (y0b <= y0s) and (x1b >= x1s) and (y1b >= y1s)
 
 def filter_contained_boxes(boxes):
-    """
-    Removes any box that is fully contained in a bigger box.
-    We only discard if the containing box's area >= contained box's area.
-    """
     final = []
     for i, box in enumerate(boxes):
         contained = False
@@ -54,15 +69,9 @@ def filter_contained_boxes(boxes):
     return final
 
 def boxes_close_in_2d(boxA, boxB, dist=10):
-    """
-    Returns True if the minimal gap between boxA and boxB in both x and y
-    is <= dist. This allows merging of boxes that are near each other
-    (horizontally or vertically) by up to 'dist' pixels.
-    """
     xA1, yA1, xA2, yA2 = boxA
     xB1, yB1, xB2, yB2 = boxB
 
-    # Horizontal gap
     if xA2 < xB1:
         gap_x = xB1 - xA2
     elif xB2 < xA1:
@@ -70,7 +79,6 @@ def boxes_close_in_2d(boxA, boxB, dist=10):
     else:
         gap_x = 0
 
-    # Vertical gap
     if yA2 < yB1:
         gap_y = yB1 - yA2
     elif yB2 < yA1:
@@ -81,10 +89,6 @@ def boxes_close_in_2d(boxA, boxB, dist=10):
     return (gap_x <= dist) and (gap_y <= dist)
 
 def merge_all_close_boxes(boxes, dist=10):
-    """
-    Iteratively merges bounding boxes if they overlap or are close in 2D
-    until no more merges occur.
-    """
     boxes = boxes[:]
     changed = True
     while changed:
@@ -104,17 +108,12 @@ def merge_all_close_boxes(boxes, dist=10):
     return boxes
 
 def reorder_boxes_grid(merged_boxes, expected):
-    """
-    Reorder the list of boxes so that they are arranged in grid order.
-    We assume the grid is roughly square. For example, if expected==16, we try to produce 4 rows.
-    """
     if not merged_boxes:
         return merged_boxes
 
     centers = [((b[0] + b[2]) / 2, (b[1] + b[3]) / 2) for b in merged_boxes]
     grid_rows = int(round(expected ** 0.5)) or 1
 
-    # Sort by vertical center
     boxes_sorted = sorted(zip(merged_boxes, centers), key=lambda bc: bc[1][1])
     ys = [c[1] for _, c in boxes_sorted]
     min_y, max_y = min(ys), max(ys)
@@ -133,14 +132,14 @@ def reorder_boxes_grid(merged_boxes, expected):
 
     return final_boxes
 
-def extract_sprites(image_path, output_dir, expected=16, buffer=3, min_area=500):
+def extract_sprites(image_path, output_dir, expected=16, buffer=3, min_area=500,
+                    remove_outline=False, erosion_size=1, smooth=False, smooth_radius=1):
     name = os.path.splitext(os.path.basename(image_path))[0]
     image = Image.open(image_path).convert("RGBA")
     alpha = np.array(image.split()[-1])
 
     # Create a mask from the alpha channel.
     mask = alpha > 16
-    # Possibly enlarge structure or iterations if needed
     mask = binary_closing(mask, structure=np.ones((3, 3)), iterations=2)
 
     labeled = label(mask)
@@ -150,7 +149,6 @@ def extract_sprites(image_path, output_dir, expected=16, buffer=3, min_area=500)
     if len(regions) < expected:
         print(f"[{name}] ⚠️ Found only {len(regions)} regions, expected {expected}. Continuing anyway.")
 
-    # Build bounding boxes from each region
     initial_boxes = []
     for r in regions:
         minr, minc, maxr, maxc = r.bbox
@@ -162,26 +160,29 @@ def extract_sprites(image_path, output_dir, expected=16, buffer=3, min_area=500)
         )
         initial_boxes.append(box)
 
-    # Merge them iteratively
     merged_boxes = merge_all_close_boxes(initial_boxes, dist=10)
-
-    # Remove any smaller boxes fully contained by a bigger box
     filtered_boxes = filter_contained_boxes(merged_boxes)
-
-    # Reorder boxes into a grid
     final_boxes = reorder_boxes_grid(filtered_boxes, expected)
 
-    # Draw and save
     debug_img = image.copy()
     draw = ImageDraw.Draw(debug_img)
     saved = 0
+
     for box in final_boxes:
         if saved >= expected:
             break
         x0, y0, x1, y1 = box
         cropped = image.crop(box)
         cleaned = remove_white_border(cropped)
-        cleaned.save(os.path.join(output_dir, f"{name}_{saved}.png"))
+
+        if remove_outline:
+            cleaned = shave_outline(cleaned, erosion_size=erosion_size)
+            if smooth:
+                cleaned = smooth_alpha(cleaned, radius=smooth_radius)
+
+        out_name = f"{name}_{saved}.png"
+        cleaned.save(os.path.join(output_dir, out_name))
+
         draw.rectangle(box, outline="purple", width=2)
         draw.text((x0 + 2, y0 + 2), f"{saved}", fill="purple")
         saved += 1
@@ -190,13 +191,39 @@ def extract_sprites(image_path, output_dir, expected=16, buffer=3, min_area=500)
     debug_img.save(debug_path)
     print(f"✅ {name}: Saved {saved} sprites, debug overlay → {debug_path}")
 
-def main():
+def main(args):
     folder = os.getcwd()
     output_dir = os.path.join(folder, "output_sprites")
     os.makedirs(output_dir, exist_ok=True)
     for file in os.listdir(folder):
         if file.lower().endswith((".png", ".webp")):
-            extract_sprites(os.path.join(folder, file), output_dir)
+            extract_sprites(
+                image_path=os.path.join(folder, file),
+                output_dir=output_dir,
+                expected=args.expected,
+                buffer=args.buffer,
+                min_area=args.min_area,
+                remove_outline=args.remove_outline,
+                erosion_size=args.erosion_size,
+                smooth=args.smooth,
+                smooth_radius=args.smooth_radius
+            )
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Extract sprites with optional outline removal and smoothing.")
+    parser.add_argument("--remove-outline", action="store_true",
+                        help="Erode alpha to remove the outer halo.")
+    parser.add_argument("--expected", type=int, default=16,
+                        help="Expected number of sprites.")
+    parser.add_argument("--buffer", type=int, default=3,
+                        help="Buffer (in pixels) around each bounding box.")
+    parser.add_argument("--min_area", type=int, default=500,
+                        help="Minimum area for a region to be considered.")
+    parser.add_argument("--erosion-size", type=int, default=1,
+                        help="Erosion size for alpha channel erosion (default: 1).")
+    parser.add_argument("--smooth", action="store_true",
+                        help="Apply Gaussian smoothing to the alpha channel after erosion.")
+    parser.add_argument("--smooth-radius", type=float, default=1,
+                        help="Gaussian blur radius for smoothing (default: 1).")
+    args = parser.parse_args()
+    main(args)
